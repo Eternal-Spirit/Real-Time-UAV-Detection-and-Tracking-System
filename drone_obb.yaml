@@ -1,0 +1,7 @@
+names:
+- Anti-Drone
+nc: 1
+train: Anti-drone-10/train/images
+val: Anti-drone-10/valid/images
+
+task: obb

@@ -1,0 +1,12 @@
+names:
+- Anti-Drone
+nc: 1
+roboflow:
+  license: CC BY 4.0
+  project: anti-drone
+  url: https://universe.roboflow.com/drone-detection-fn0bd/anti-drone/dataset/10
+  version: 10
+  workspace: drone-detection-fn0bd
+test: Anti-drone-10/test/images
+train: Anti-drone-10/train/images
+val: Anti-drone-10/valid/images
