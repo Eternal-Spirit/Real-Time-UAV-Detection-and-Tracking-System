@@ -29,4 +29,14 @@ ENV/
 # Project specifics
 runs/
 outputs/
+Anti-drone-10/
+weights/
+FastSAM-s.pt
+models/*_old*
+scratch_*.py
+*.log
+*.mp4
+*.avi
+*.mkv
 .DS_Store
+

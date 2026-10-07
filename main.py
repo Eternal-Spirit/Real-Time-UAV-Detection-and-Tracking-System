@@ -7,6 +7,8 @@ main.py — Phase 9 changes:
 
 import cv2
 import time
+import math
+import torch
 import numpy as np
 from collections import defaultdict
 from ultralytics import YOLO
@@ -20,9 +22,10 @@ from config import (
     DRONE_TYPE_COLORS,                           # ← Phase 8
     MODEL_PATH_OBB, USE_OBB,                     # ← Phase 9
     KNOWN_DRONE_WIDTH_M, FOCAL_LENGTH_PX,        # Distance estimation
+    FRAME_WIDTH, FRAME_HEIGHT,
 )
 from utils import (
-    get_threat_level, draw_zones,
+    get_threat_level, draw_zones, update_zone_dimensions,
     update_trail, draw_trail, draw_prediction, draw_direction_arrow,
     heatmap,
     get_heading, get_approach_warnings,
@@ -42,7 +45,35 @@ if USE_OBB:
 zone_frame_counter = defaultdict(lambda: defaultdict(int))
 latest_zone        = {}
 _frame_count       = 0
-_last_heading      = None    # track last heading for compass
+_last_heading      = None
+_fallback_id_counter = 100
+_active_track_centroids = {}
+
+def _resolve_track_id(raw_id: int | None, cx: float, cy: float, current_frame: int) -> int:
+    global _fallback_id_counter
+    if raw_id is not None and raw_id >= 0:
+        _active_track_centroids[raw_id] = (cx, cy, current_frame)
+        return raw_id
+    
+    # Associate unassigned detection with nearest active track within 120 pixels
+    best_tid = None
+    min_dist = 120.0
+    for tid, (last_x, last_y, last_f) in list(_active_track_centroids.items()):
+        if current_frame - last_f > 20:
+            continue
+        dist = math.hypot(cx - last_x, cy - last_y)
+        if dist < min_dist:
+            min_dist = dist
+            best_tid = tid
+            
+    if best_tid is not None:
+        _active_track_centroids[best_tid] = (cx, cy, current_frame)
+        return best_tid
+        
+    _fallback_id_counter += 1
+    new_id = _fallback_id_counter
+    _active_track_centroids[new_id] = (cx, cy, current_frame)
+    return new_id
 
 
 def process_frame(frame: np.ndarray,
@@ -50,7 +81,10 @@ def process_frame(frame: np.ndarray,
                   show_prediction: bool = True,
                   show_arrow:      bool = True,
                   show_heatmap:    bool = True,
-                  show_heading:    bool = True) -> tuple[np.ndarray, list]:
+                  show_heading:    bool = True,
+                  use_obb:         bool = None,
+                  conf_thresh:     float = None,
+                  enable_clahe:    bool = False) -> tuple[np.ndarray, list]:
     """
     Full pipeline for one frame — Phases 1–9.
     """
@@ -58,11 +92,27 @@ def process_frame(frame: np.ndarray,
     _frame_count += 1
     _t0 = time.perf_counter()
 
-    # Resize any high-res video down to 360p to absolutely maximize FPS.
-    # The heatmap is disabled and this will run extremely fast.
-    frame = cv2.resize(frame, (640, 360))
+    active_use_obb = USE_OBB if use_obb is None else use_obb
+    active_conf = CONFIDENCE if conf_thresh is None else conf_thresh
+
+    # High-resolution input adaptation:
+    # If the frame width exceeds 1280 (e.g. 1080p, 2K, 4K UHD), downscale proportionally
+    # to 1280 width using cv2.INTER_AREA to preserve fine drone features and rotors
+    # without destroying small targets (unlike destructive 640x360 downscaling).
+    h, w = frame.shape[:2]
+    if w > 1280:
+        new_w = 1280
+        new_h = int(round(h * (1280.0 / w)))
+        if new_h % 2 != 0:
+            new_h += 1
+        frame = cv2.resize(frame, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        h, w = frame.shape[:2]
+
+    # Ensure geofence zones and heatmap match working frame dimensions
+    update_zone_dimensions(w, h)
     
-    frame = preprocess(frame)
+    if enable_clahe:
+        frame = preprocess(frame)
     clean_frame = frame.copy()  # Save clean frame for YOLO
 
     if show_heatmap:
@@ -74,10 +124,13 @@ def process_frame(frame: np.ndarray,
     # ── Unified Detection Logic ────────────────────────────────────
     unified_boxes = []
 
-    if USE_OBB:
-        obb_results = track_with_angle(clean_frame, conf_thresh=CONFIDENCE)
+    dev = 0 if torch.cuda.is_available() else 'cpu'
+
+    if active_use_obb:
+        obb_results = track_with_angle(clean_frame, conf_thresh=active_conf, imgsz=IMG_SIZE, device=dev)
         for obb in obb_results:
-            track_id = obb['track_id'] if obb['track_id'] is not None else -1
+            cx, cy = obb['cx'], obb['cy']
+            track_id = _resolve_track_id(obb['track_id'], cx, cy, _frame_count)
             
             pts = obb['pts']
             x1 = int(pts[:, 0].min())
@@ -88,7 +141,7 @@ def process_frame(frame: np.ndarray,
             unified_boxes.append({
                 'track_id': track_id,
                 'x1': x1, 'y1': y1, 'x2': x2, 'y2': y2,
-                'cx': obb['cx'], 'cy': obb['cy'],
+                'cx': cx, 'cy': cy,
                 'conf': obb['conf'],
                 'angle_deg': obb['angle'],
                 'pts': pts
@@ -97,16 +150,19 @@ def process_frame(frame: np.ndarray,
         results = model.track(
             clean_frame,
             persist = True,
-            conf    = CONFIDENCE,
+            tracker = "bytetrack.yaml",
+            conf    = active_conf,
             imgsz   = IMG_SIZE,
+            device  = dev,
             verbose = False,
         )
         if results[0].boxes is not None:
             for box in results[0].boxes:
-                track_id = int(box.id[0]) if box.id is not None else -1
+                raw_id = int(box.id[0]) if box.id is not None else None
                 x1, y1, x2, y2 = box.xyxy[0].tolist()
                 cx = (x1 + x2) / 2
                 cy = (y1 + y2) / 2
+                track_id = _resolve_track_id(raw_id, cx, cy, _frame_count)
                 
                 unified_boxes.append({
                     'track_id': track_id,
@@ -225,6 +281,14 @@ def process_frame(frame: np.ndarray,
                 frame, track_id, cx, cy,
                 heading, approach_warnings,
             )
+        elif show_heading and angle_deg is not None:
+            # Draw physical orientation arrow from OBB angle while trajectory is accumulating
+            rad = math.radians(angle_deg)
+            arrow_len = 40
+            ex = int(cx + arrow_len * math.cos(rad))
+            ey = int(cy + arrow_len * math.sin(rad))
+            cv2.arrowedLine(frame, (int(cx), int(cy)), (ex, ey),
+                            (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.3)
         elif show_arrow:
             # Fallback: Phase 3 simple arrow if heading disabled
             frame = draw_direction_arrow(frame, track_id, cx, cy)

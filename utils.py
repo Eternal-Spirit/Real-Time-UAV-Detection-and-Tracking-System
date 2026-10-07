@@ -8,6 +8,32 @@ from config import (
 )
 
 
+_current_w = 640
+_current_h = 360
+_active_zones = {k: v.copy() for k, v in ZONES.items()}
+
+def update_zone_dimensions(frame_w: int, frame_h: int) -> None:
+    """
+    Scales the nominal 640x360 geofence zones to match the current frame resolution.
+    Also ensures the heatmap accumulator matches the frame size.
+    """
+    global _current_w, _current_h, _active_zones
+    if frame_w == _current_w and frame_h == _current_h:
+        return
+    _current_w = frame_w
+    _current_h = frame_h
+    scale_x = frame_w / 640.0
+    scale_y = frame_h / 360.0
+    _active_zones = {}
+    for level, pts in ZONES.items():
+        scaled_pts = pts.copy().astype(np.float32)
+        scaled_pts[:, 0] *= scale_x
+        scaled_pts[:, 1] *= scale_y
+        _active_zones[level] = scaled_pts.astype(np.int32)
+    if 'heatmap' in globals() and (heatmap.width != frame_w or heatmap.height != frame_h):
+        heatmap.resize(frame_w, frame_h)
+
+
 def get_threat_level(cx: float, cy: float) -> str | None:
     """
     Returns the threat zone ('HIGH', 'MEDIUM', 'LOW') the drone
@@ -29,7 +55,7 @@ def get_threat_level(cx: float, cy: float) -> str | None:
     pt = (int(cx), int(cy))
 
     for level in ['HIGH', 'MEDIUM', 'LOW']:   # innermost first
-        result = cv2.pointPolygonTest(ZONES[level], pt, measureDist=False)
+        result = cv2.pointPolygonTest(_active_zones[level], pt, measureDist=False)
         if result >= 0:          # 0 = on edge, 1 = inside
             return level
 
@@ -47,11 +73,16 @@ def draw_zones(frame: np.ndarray) -> np.ndarray:
     Returns:
         Annotated BGR image
     """
+    if not GEOFENCE_ENABLED:
+        return frame
+
+    h, w = frame.shape[:2]
+    update_zone_dimensions(w, h)
     overlay = frame.copy()
 
     # Draw fills (outermost first so inner zones paint on top)
     for level in ['LOW', 'MEDIUM', 'HIGH']:
-        cv2.fillPoly(overlay, [ZONES[level]], ZONE_COLORS[level])
+        cv2.fillPoly(overlay, [_active_zones[level]], ZONE_COLORS[level])
 
     # Blend overlay with original — alpha=0.15 keeps it subtle
     frame = cv2.addWeighted(frame, 0.85, overlay, 0.15, 0)
@@ -60,7 +91,7 @@ def draw_zones(frame: np.ndarray) -> np.ndarray:
     for level in ['LOW', 'MEDIUM', 'HIGH']:
         cv2.polylines(
             frame,
-            [ZONES[level]],
+            [_active_zones[level]],
             isClosed=True,
             color=ZONE_BORDER_COLORS[level],
             thickness=2,
@@ -69,7 +100,7 @@ def draw_zones(frame: np.ndarray) -> np.ndarray:
 
     # Zone labels — positioned at top-left corner of each polygon bbox
     for level in ['LOW', 'MEDIUM', 'HIGH']:
-        pts   = ZONES[level]
+        pts   = _active_zones[level]
         lx    = int(pts[:, 0].min()) + 6
         ly    = int(pts[:, 1].min()) + 18
         color = ZONE_BORDER_COLORS[level]
@@ -104,7 +135,7 @@ def draw_trail(frame: np.ndarray, track_id: int) -> np.ndarray:
     """
     Draws a fading trail of lines connecting the drone's past positions.
     Most recent segment is brightest; oldest is nearly invisible.
-    Colour fades from dim yellow (old) to bright cyan (recent).
+    Colour fades from warm gold (old) to electric neon cyan (recent).
 
     Args:
         frame    : BGR image to draw on
@@ -120,36 +151,35 @@ def draw_trail(frame: np.ndarray, track_id: int) -> np.ndarray:
         return frame
 
     for i in range(1, n):
-        # Alpha goes from ~40 (oldest) to 255 (newest)
-        alpha  = int(40 + 215 * (i / n))
+        progress = i / n
+        # Color gradient: warm gold (old) -> vivid neon cyan (recent)
+        b = int(255 * progress)
+        g = int(200 + 55 * progress)
+        r = int(60 * (1.0 - progress))
 
-        # Colour interpolates: old = dim yellow, recent = bright cyan
-        b = alpha
-        g = alpha
-        r = int(alpha * (1 - i / n))          # red fades out toward recent
-
-        thickness = 1 if i < n // 2 else 2    # thicker near current pos
+        thickness = 2 if i < n // 2 else 3
         cv2.line(frame, trail[i - 1], trail[i], (b, g, r),
                  thickness, cv2.LINE_AA)
+
+        # Draw glowing waypoint dots along the trail
+        if i % 4 == 0 or i == n - 1:
+            radius = 2 if i < n - 1 else 4
+            cv2.circle(frame, trail[i], radius, (b, g, r), -1, cv2.LINE_AA)
 
     return frame
 
 
 def draw_prediction(frame: np.ndarray, track_id: int,
-                    steps: int = 10) -> np.ndarray:
+                    steps: int = 12) -> np.ndarray:
     """
-    Extrapolates the drone's trajectory linearly using the last 2
-    positions and draws `steps` predicted future positions as
-    dashed dots in orange.
-
-    Prediction is intentionally simple (linear) — it gives useful
-    directional intent without over-engineering. Replace with a
-    Kalman smoother in a future phase if needed.
+    Extrapolates the drone's trajectory using recent motion velocity
+    and renders a projected trajectory vector line with waypoint nodes
+    and a forward directional arrow.
 
     Args:
         frame    : BGR image to draw on
         track_id : tracker ID to predict for
-        steps    : how many frames ahead to predict (default 10)
+        steps    : how many frames ahead to predict (default 12)
 
     Returns:
         Annotated frame
@@ -159,31 +189,43 @@ def draw_prediction(frame: np.ndarray, track_id: int,
     if len(trail) < 2:
         return frame
 
-    # Velocity vector from last 2 points
-    dx = trail[-1][0] - trail[-2][0]
-    dy = trail[-1][1] - trail[-2][1]
+    # Velocity vector from last 2 or 3 points
+    if len(trail) >= 3:
+        dx = (trail[-1][0] - trail[-3][0]) / 2.0
+        dy = (trail[-1][1] - trail[-3][1]) / 2.0
+    else:
+        dx = float(trail[-1][0] - trail[-2][0])
+        dy = float(trail[-1][1] - trail[-2][1])
+
+    speed = math.hypot(dx, dy)
 
     # Skip prediction if drone is stationary (hovering)
-    if abs(dx) < 1 and abs(dy) < 1:
+    if speed < 0.6:
         return frame
 
     h, w = frame.shape[:2]
+    curr_x, curr_y = trail[-1]
+    prev_pt = (int(curr_x), int(curr_y))
 
     for s in range(1, steps + 1):
-        px = int(trail[-1][0] + dx * s)
-        py = int(trail[-1][1] + dy * s)
+        px = int(curr_x + dx * s)
+        py = int(curr_y + dy * s)
 
         # Don't draw outside frame bounds
         if not (0 <= px < w and 0 <= py < h):
             break
 
-        # Dashed pattern: draw every other step
-        if s % 2 == 0:
-            # Fade dot size and brightness with distance
-            radius    = max(1, 3 - s // 4)
-            intensity = max(80, 200 - s * 12)
-            cv2.circle(frame, (px, py), radius,
-                       (0, intensity, 255), -1, cv2.LINE_AA)
+        curr_pt = (px, py)
+        # Draw dashed projected trajectory line
+        if s % 2 == 1:
+            cv2.line(frame, prev_pt, curr_pt, (0, 165, 255), 2, cv2.LINE_AA)
+            cv2.circle(frame, curr_pt, 3, (0, 215, 255), -1, cv2.LINE_AA)
+        prev_pt = curr_pt
+
+    # Arrow head at end of predicted trajectory vector
+    if prev_pt != (int(curr_x), int(curr_y)):
+        cv2.arrowedLine(frame, (int(curr_x), int(curr_y)), prev_pt,
+                        (0, 165, 255), 2, cv2.LINE_AA, tipLength=0.18)
 
     return frame
 
@@ -364,6 +406,17 @@ class DroneHeatmap:
         """Clears all accumulated heatmap data."""
         self.acc.fill(0)
 
+    def resize(self, width: int, height: int) -> None:
+        """Resizes the accumulator grid to match updated frame dimensions."""
+        if self.width == width and self.height == height:
+            return
+        if self.acc.max() > 0:
+            self.acc = cv2.resize(self.acc, (width, height), interpolation=cv2.INTER_LINEAR)
+        else:
+            self.acc = np.zeros((height, width), dtype=np.float32)
+        self.width = width
+        self.height = height
+
     @property
     def total_detections(self) -> int:
         """Rough count of total drone-frame hits accumulated."""
@@ -420,15 +473,19 @@ def get_heading(track_id: int) -> dict | None:
     """
     trail = list(trail_history[track_id])
 
-    if len(trail) < 3:
+    if len(trail) < 2:
         return None
 
-    # 2-step displacement for stability
-    dx = trail[-1][0] - trail[-3][0]
-    dy = trail[-1][1] - trail[-3][1]
+    if len(trail) >= 3:
+        dx = (trail[-1][0] - trail[-3][0]) / 2.0
+        dy = (trail[-1][1] - trail[-3][1]) / 2.0
+    else:
+        dx = float(trail[-1][0] - trail[-2][0])
+        dy = float(trail[-1][1] - trail[-2][1])
+
     speed = math.hypot(dx, dy)
 
-    if speed < MIN_MOVEMENT_PX:
+    if speed < 0.8:
         return None    # hovering — no meaningful heading
 
     # Screen-space angle (y-axis points DOWN in OpenCV)
@@ -449,7 +506,7 @@ def get_heading(track_id: int) -> dict | None:
         'cardinal':   cardinal,
         'dx':         dx,
         'dy':         dy,
-        'speed_px':   speed / 2,       # per-frame speed (divide by 2-step window)
+        'speed_px':   speed,           # per-frame speed estimate
     }
 
 
@@ -457,8 +514,8 @@ def get_heading(track_id: int) -> dict | None:
 
 def _zone_centroid(zone_name: str) -> tuple[float, float]:
     """Returns the pixel centroid of a zone polygon."""
-    from config import ZONES
-    pts = ZONES[zone_name].astype(np.float32)
+    poly = _active_zones.get(zone_name, ZONES.get(zone_name))
+    pts = poly.astype(np.float32)
     return float(pts[:, 0].mean()), float(pts[:, 1].mean())
 
 
@@ -700,8 +757,7 @@ def is_heading_toward_zone_obb(angle_deg, cx, cy, zone_name, threshold_deg=60):
     Returns True if the drone's heading points within threshold_deg of
     the centroid of the named zone. Works with Phase 9 angles.
     """
-    from config import ZONES
-    zone_poly = ZONES.get(zone_name)
+    zone_poly = _active_zones.get(zone_name, ZONES.get(zone_name))
     if zone_poly is None:
         return False
     # Compute zone centroid

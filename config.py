@@ -7,12 +7,12 @@ MODEL       = 'yolov8s.pt'       # upgraded from yolov8n.pt
 MODEL_PATH  = 'models/best.pt'   # update this after retraining
 
 # ── Detection ─────────────────────────────────────────────────
-CONFIDENCE      = 0.40
+CONFIDENCE      = 0.30
 IOU_THRESHOLD   = 0.45
-IMG_SIZE        = 640
+IMG_SIZE        = 960
 
 # ── CLAHE preprocessing ───────────────────────────────────────
-CLAHE_ENABLED   = True
+CLAHE_ENABLED   = False
 CLAHE_CLIP      = 2.0
 CLAHE_GRID      = (8, 8)
 
@@ -128,13 +128,13 @@ BEEP_DURATION_MS   =  350   # beep length in milliseconds
 SNAPSHOT_ZONES = set()
 
 # ── Stats & graphs ────────────────────────────────────────────
-STATS_ENABLED        = False
+STATS_ENABLED        = True
 GPU_POLL_INTERVAL    = 2.0    # seconds between nvidia-smi polls
-GRAPH_REFRESH_FRAMES = 999999 # completely disabled to prevent matplotlib lag spikes
+GRAPH_REFRESH_FRAMES = 60     # refresh graphs every 60 frames (~2-3 sec)
 
 # Path to YOLOv8 training results CSV for model training curves
 # Using the active document path the user had open
-TRAINING_RESULTS_CSV = 'runs/detect/runs/train/yolov8s_clahe_v12/results.csv'
+TRAINING_RESULTS_CSV = 'runs/train/yolov8s_5060_100ep/results.csv'
 
 # ── Heading / angle ───────────────────────────────────────────
 HEADING_ENABLED      = True

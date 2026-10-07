@@ -3,5 +3,6 @@ names:
 nc: 1
 train: Anti-drone-10/train/images
 val: Anti-drone-10/valid/images
+test: Anti-drone-10/test/images
 
 task: obb

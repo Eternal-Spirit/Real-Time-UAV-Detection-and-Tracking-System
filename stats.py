@@ -198,12 +198,14 @@ def _base_fig(figsize=(10, 3.5)):
     return fig, ax
 
 
+from matplotlib.backends.backend_agg import FigureCanvasAgg
+
+
 def fig_to_numpy(fig) -> np.ndarray:
     """Converts a matplotlib figure to an RGB numpy array for Streamlit."""
-    fig.canvas.draw()
-    # Matplotlib 3.8+ compatibility
-    rgba = np.asarray(fig.canvas.buffer_rgba())
-    # Extract RGB channels from RGBA
+    canvas = FigureCanvasAgg(fig)
+    canvas.draw()
+    rgba = np.asarray(canvas.buffer_rgba())
     img = rgba[..., :3].copy()
     plt.close(fig)
     return img
@@ -540,6 +542,7 @@ def plot_heading_history(stats_obj) -> np.ndarray:
     ax.set_theta_direction(-1)
     ax.set_title('Heading Distribution', color=TEXT_CLR,
                  fontsize=10, pad=12)
+    ax.set_xticks(np.linspace(0, 2 * np.pi, 8, endpoint=False))
     ax.set_xticklabels(['N','NE','E','SE','S','SW','W','NW'],
                         color=TEXT_CLR, fontsize=8)
     plt.tight_layout()

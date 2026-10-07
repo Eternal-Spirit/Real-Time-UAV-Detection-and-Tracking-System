@@ -1,6 +1,7 @@
 import cv2
 import math
 import numpy as np
+import torch
 from ultralytics import YOLO
 
 # Load OBB model once at module level
@@ -12,7 +13,7 @@ def load_obb_model(weights_path='models/obb_best.pt'):
     _obb_model = YOLO(weights_path)
     print(f"OBB model loaded: {weights_path}")
 
-def track_with_angle(frame, conf_thresh=0.40):
+def track_with_angle(frame, conf_thresh=0.40, imgsz=960, device=None):
     """
     Run YOLOv8-OBB inference on frame and uses model.track() to get persistent track IDs.
     Returns a list of dicts, one per detection:
@@ -33,8 +34,17 @@ def track_with_angle(frame, conf_thresh=0.40):
         print("WARNING: OBB model not loaded.")
         return []
 
-    results = _obb_model.track(frame, persist=True,
-                               conf=conf_thresh, verbose=False)[0]
+    dev = 0 if (device is None and torch.cuda.is_available()) else (device if device is not None else 'cpu')
+
+    results = _obb_model.track(
+        frame,
+        persist=True,
+        tracker="bytetrack.yaml",
+        conf=conf_thresh,
+        imgsz=imgsz,
+        device=dev,
+        verbose=False
+    )[0]
     detections = []
 
     if results.obb is None:
